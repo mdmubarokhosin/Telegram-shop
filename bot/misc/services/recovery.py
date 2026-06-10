@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class RecoveryManager:
-    """Disaster Recovery Manager — payment recovery and health monitoring"""
+    """ডিজাস্টার রিকভারি ম্যানেজার — পেমেন্ট রিকভারি এবং হেলথ মনিটরিং"""
 
     def __init__(self, bot):
         self.bot = bot
@@ -16,8 +16,8 @@ class RecoveryManager:
         self.running = False
 
     async def start(self):
-        """Starting the recovery system"""
-        logger.info("Starting recovery manager...")
+        """রিকভারি সিস্টেম শুরু করা হচ্ছে"""
+        logger.info("রিকভারি ম্যানেজার শুরু হচ্ছে...")
         self.running = True
 
         self.recovery_tasks.append(
@@ -29,26 +29,26 @@ class RecoveryManager:
         )
 
     async def stop(self):
-        """Stopping the recovery system"""
+        """রিকভারি সিস্টেম বন্ধ করা হচ্ছে"""
         self.running = False
         for task in self.recovery_tasks:
             task.cancel()
         await asyncio.gather(*self.recovery_tasks, return_exceptions=True)
-        logger.info("Recovery manager stopped")
+        logger.info("রিকভারি ম্যানেজার বন্ধ হয়েছে")
 
     async def _safe_run(self, coro_func, *args):
-        """Safe startup with automatic restart on failure"""
+        """নিরাপদ শুরু স্বয়ংক্রিয় পুনরায় আরম্ভ সহ ব্যর্থতার উপর"""
         while self.running:
             try:
                 await coro_func(*args)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Recovery task error: {e}", exc_info=True)
+                logger.error(f"রিকভারি টাস্ক ত্রুটি: {e}", exc_info=True)
                 await asyncio.sleep(30)
 
     async def recover_pending_payments(self):
-        """Recovery of suspended payments"""
+        """পেন্ডিং পেমেন্ট রিকভারি করা হচ্ছে — Bohudur পেমেন্ট চেক করা হবে"""
         from bot.database import Database
         from bot.database.models import Payments
 
@@ -61,7 +61,7 @@ class RecoveryManager:
                         select(Payments).where(
                             Payments.status == "pending",
                             Payments.created_at < cutoff,
-                            Payments.provider == "cryptopay"
+                            Payments.provider == "bohudur"
                         )
                     )
                     pending_payments = result.scalars().all()
@@ -80,19 +80,16 @@ class RecoveryManager:
                     await self._check_and_process_payment(pc)
 
             except Exception as e:
-                logger.error(f"Error recovering payments: {e}")
+                logger.error(f"পেমেন্ট রিকভারি ত্রুটি: {e}")
 
             await asyncio.sleep(300)
 
     async def _check_and_process_payment(self, payment):
-        """Verification and processing of a specific payment.
-
-        Args:
-            payment: dict with keys id, provider, external_id, user_id, amount, currency
-        """
+        """একটি নির্দিষ্ট পেমেন্ট যাচাই এবং প্রক্রিয়া করা"""
+        from decimal import Decimal
         from bot.database.methods.transactions import process_payment_with_referral
         from bot.misc import EnvKeys
-        from bot.misc.services.payment import CryptoPayAPI
+        from bot.misc.services.payment import BohudurAPI, BohudurAPIError
         from bot.i18n import localize
 
         p_id = payment['id'] if isinstance(payment, dict) else payment.id
@@ -103,37 +100,49 @@ class RecoveryManager:
         p_currency = payment['currency'] if isinstance(payment, dict) else payment.currency
 
         try:
-            if p_provider == "cryptopay" and EnvKeys.CRYPTO_PAY_TOKEN:
-                crypto = CryptoPayAPI()
-                info = await crypto.get_invoice(p_external_id)
+            if p_provider == "bohudur" and EnvKeys.BOHUDUR_API_KEY:
+                bohudur = BohudurAPI()
+                info = await bohudur.query_payment(p_external_id)
 
-                if info.get("status") == "paid":
+                status = info.get("status", "")
+
+                if status == "COMPLETED":
+                    # পেমেন্ট সম্পন্ন হয়েছে — execute করুন
+                    try:
+                        await bohudur.execute_payment(p_external_id)
+                    except BohudurAPIError:
+                        pass  # ইতিমধ্যে execute হয়ে থাকতে পারে
+
+                    balance_amount = int(info.get("amount", p_amount))
+
                     success, _ = await process_payment_with_referral(
                         user_id=p_user_id,
-                        amount=p_amount,
+                        amount=Decimal(balance_amount),
                         provider=p_provider,
                         external_id=p_external_id,
                         referral_percent=EnvKeys.REFERRAL_PERCENT
                     )
 
                     if success:
-                        logger.info(f"Recovered payment {p_external_id}")
+                        logger.info(f"পেমেন্ট রিকভারি সফল: {p_external_id}")
                         try:
                             await self.bot.send_message(
                                 p_user_id,
-                                localize("payments.topped_simple", amount=p_amount, currency=p_currency)
+                                localize("payments.topped_simple", amount=balance_amount, currency=p_currency)
                             )
                         except Exception as e:
-                            logger.error(f"Failed to notify user {p_user_id}: {e}")
+                            logger.error(f"ইউজারকে জানাতে ব্যর্থ {p_user_id}: {e}")
 
-                elif info.get("status") in ["expired", "failed"]:
+                elif status in ["CANCELLED", "EXPIRED", "FAILED"]:
                     await self._mark_payment_failed(p_id)
 
+        except BohudurAPIError as e:
+            logger.error(f"Bohudur API ত্রুটি পেমেন্ট {p_id}: [{e.code}] {e.message}")
         except Exception as e:
-            logger.error(f"Error processing payment {p_id}: {e}")
+            logger.error(f"পেমেন্ট প্রক্রিয়াকরণ ত্রুটি {p_id}: {e}")
 
     async def _mark_payment_failed(self, payment_id: int):
-        """Mark payment as failed."""
+        """পেমেন্ট ব্যর্থ হিসেবে চিহ্নিত করুন"""
         from bot.database import Database
         from bot.database.models import Payments
 
@@ -143,7 +152,7 @@ class RecoveryManager:
             )
 
     async def periodic_health_check(self):
-        """Periodic system health checks"""
+        """নিয়মিত সিস্টেম হেলথ চেক"""
         from bot.database import Database
 
         while self.running:
@@ -154,13 +163,13 @@ class RecoveryManager:
                 from bot.misc.caching.cache import get_cache_manager
                 cache = get_cache_manager()
                 if cache:
+                    await cache.check_health()
                     await cache.set("health:check", "ok", ttl=60)
 
                 me = await self.bot.get_me()
-
-                logger.debug(f"Health check passed: Bot @{me.username} is alive")
+                logger.debug(f"হেলথ চেক সফল: Bot @{me.username} সক্রিয় আছে")
 
             except Exception as e:
-                logger.error(f"Health check failed: {e}")
+                logger.error(f"হেলথ চেক ব্যর্থ: {e}")
 
             await asyncio.sleep(60)
